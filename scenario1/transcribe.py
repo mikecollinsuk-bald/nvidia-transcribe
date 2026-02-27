@@ -5,6 +5,7 @@ Uses NVIDIA's parakeet-tdt-0.6b-v2 model to transcribe a single audio file.
 Accepts audio file path as command-line argument.
 """
 
+import os
 import sys
 import tempfile
 from datetime import datetime
@@ -12,6 +13,14 @@ from pathlib import Path
 
 import librosa
 import soundfile as sf
+
+# Fix Windows temp directory issue with NeMo/lhotse (avoid paths with spaces)
+_repo_root = Path(__file__).parent.resolve().parent
+_local_temp = _repo_root / "temp"
+_local_temp.mkdir(exist_ok=True)
+os.environ["TEMP"] = str(_local_temp)
+os.environ["TMP"] = str(_local_temp)
+tempfile.tempdir = str(_local_temp)
 
 # Supported audio extensions
 AUDIO_EXTENSIONS = {'.wav', '.flac', '.mp3'}

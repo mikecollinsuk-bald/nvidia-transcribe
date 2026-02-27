@@ -17,8 +17,10 @@ Local audio transcription using NVIDIA ASR models via the NeMo framework, organi
 ```bash
 # Setup (Python 3.10-3.12 only)
 py -3.12 -m venv venv && venv\Scripts\activate          # Windows
-pip install torch --index-url https://download.pytorch.org/whl/cu121  # GPU
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121  # GPU (install FIRST)
 pip install -r requirements.txt && python fix_lhotse.py
+# If nemo_toolkit overwrote torch with CPU-only, re-run the torch install:
+pip install --force-reinstall torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 
 # Scenario 1: Transcribe a file
 python scenario1/transcribe.py audio.mp3

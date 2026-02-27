@@ -28,6 +28,9 @@ Thumbs.db
 # Output directory (generated transcriptions)
 output/
 
+# Temp directory (NeMo/lhotse workaround for Windows)
+temp/
+
 # C# / .NET
 bin/
 obj/
