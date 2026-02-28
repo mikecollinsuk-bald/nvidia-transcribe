@@ -16,6 +16,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -33,7 +34,7 @@ tempfile.tempdir = str(_local_temp)
 
 # Constants
 AUDIO_EXTENSIONS = {'.wav', '.flac', '.mp3'}
-ASR_MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v2"
+ASR_MODEL_NAME = "nvidia/parakeet-tdt-1.1b"
 SPEAKER_MODEL = "titanet_large"          # Speaker embedding model
 VAD_MODEL = "vad_marblenet"              # Voice activity detection model (English)
 TARGET_SAMPLE_RATE = 16000
@@ -744,6 +745,7 @@ def process_file(
     threshold: float,
 ):
     """Process a single audio file: diarize, transcribe, save outputs."""
+    file_start = time.time()
     print(f"\nAudio file: {audio_path}")
 
     # Convert to WAV (always needed for diarizer, ensure 16kHz mono)
@@ -818,6 +820,10 @@ def process_file(
             print("...")
         print("-" * 40)
 
+        file_elapsed = time.time() - file_start
+        mins, secs = divmod(file_elapsed, 60)
+        print(f"\n  Time taken: {int(mins)}m {secs:.1f}s")
+
     finally:
         # Clean up temp WAV
         if temp_wav and temp_wav.exists():
@@ -874,6 +880,7 @@ def main():
         voiceprints = load_voiceprints(voiceprints_dir)
 
     # Process each file
+    batch_start = time.time()
     for i, audio_path in enumerate(audio_paths, 1):
         if len(audio_paths) > 1:
             print(f"\n{'#' * 60}")
@@ -886,10 +893,13 @@ def main():
             voiceprints, threshold,
         )
 
+    batch_elapsed = time.time() - batch_start
+    mins, secs = divmod(batch_elapsed, 60)
+    print(f"\n{'=' * 60}")
     if len(audio_paths) > 1:
-        print(f"\n{'=' * 60}")
         print(f"  All {len(audio_paths)} files processed!")
-        print(f"{'=' * 60}")
+    print(f"  Total time: {int(mins)}m {secs:.1f}s")
+    print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
