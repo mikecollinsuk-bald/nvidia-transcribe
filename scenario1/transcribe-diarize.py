@@ -34,7 +34,7 @@ tempfile.tempdir = str(_local_temp)
 
 # Constants
 AUDIO_EXTENSIONS = {'.wav', '.flac', '.mp3'}
-ASR_MODEL_NAME = "nvidia/parakeet-tdt-1.1b"
+ASR_MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v2"
 SPEAKER_MODEL = "titanet_large"          # Speaker embedding model
 VAD_MODEL = "vad_marblenet"              # Voice activity detection model (English)
 TARGET_SAMPLE_RATE = 16000
@@ -317,9 +317,11 @@ def run_diarization(
             "speaker_embeddings": {
                 "model_path": SPEAKER_MODEL,
                 "parameters": {
-                    "window_length_in_sec": [1.5, 0.75],
-                    "shift_length_in_sec": [0.75, 0.375],
-                    "multiscale_weights": [1, 1],
+                    # 3-scale multiscale diarization for finer speaker boundaries.
+                    # The smallest scale (0.5s window) improves turn-boundary precision.
+                    "window_length_in_sec": [1.5, 0.75, 0.5],
+                    "shift_length_in_sec": [0.75, 0.375, 0.25],
+                    "multiscale_weights": [1, 1, 1],
                     "save_embeddings": False,
                 },
             },
@@ -388,7 +390,7 @@ def run_transcription(wav_path: Path) -> tuple[str, list[dict]]:
         torch.cuda.empty_cache()
 
     print("\nLoading Parakeet ASR model...")
-    print("(First run will download ~1.2GB model)")
+    print("(First run will download ~800MB model)")
     asr_model = nemo_asr.models.ASRModel.from_pretrained(ASR_MODEL_NAME)
     # Ensure model is on the correct device
     if not torch.cuda.is_available():
@@ -465,28 +467,49 @@ def assign_speakers_to_words(
 ) -> list[dict]:
     """
     For each ASR word, find which diarization speaker segment it falls into.
-    Uses the word midpoint to decide assignment. If no segment contains the
-    midpoint, assigns to the nearest segment's speaker.
+
+    Uses overlap-based assignment: calculates how much of the word's duration
+    overlaps with each speaker's segments, and assigns to the speaker with the
+    greatest overlap. This is more accurate at speaker boundaries than the
+    simpler midpoint approach, since words that straddle a boundary go to the
+    speaker covering more of the word.
+
+    Falls back to nearest-segment assignment if no overlap is found (e.g. words
+    in diarization gaps).
+
     Returns words with added 'speaker' key.
     """
     labeled = []
     for w in words:
-        mid = (w['start'] + w['end']) / 2
-        speaker = None
-        # First try: exact containment
+        w_start = w['start']
+        w_end = w['end']
+        w_dur = w_end - w_start
+
+        # Calculate overlap with each speaker's segments
+        speaker_overlap: dict[str, float] = {}
         for seg in diar_segments:
-            if seg['start'] <= mid <= seg['end']:
-                speaker = seg['speaker']
-                break
-        # Fallback: nearest segment by distance to midpoint
-        if speaker is None and diar_segments:
+            overlap_start = max(w_start, seg['start'])
+            overlap_end = min(w_end, seg['end'])
+            overlap = max(0.0, overlap_end - overlap_start)
+            if overlap > 0:
+                speaker_overlap[seg['speaker']] = (
+                    speaker_overlap.get(seg['speaker'], 0.0) + overlap
+                )
+
+        if speaker_overlap:
+            # Assign to speaker with most overlap
+            speaker = max(speaker_overlap, key=speaker_overlap.get)
+        else:
+            # Fallback: nearest segment by distance to word midpoint
+            mid = (w_start + w_end) / 2
+            speaker = None
             best_dist = float('inf')
             for seg in diar_segments:
-                # Distance from midpoint to nearest edge of segment
                 dist = min(abs(mid - seg['start']), abs(mid - seg['end']))
                 if dist < best_dist:
                     best_dist = dist
                     speaker = seg['speaker']
+
         labeled.append({**w, 'speaker': speaker or 'unknown'})
     return labeled
 
@@ -522,7 +545,190 @@ def assign_speakers_to_segments(
     return labeled
 
 
-# ─── Build speaker-labeled transcript ─────────────────────────────────
+# ─── Post-processing: fix sentence fragments at speaker boundaries ────
+
+def _word_ends_sentence(word: str) -> bool:
+    """Check if a word ends with sentence-ending punctuation (.!?)."""
+    if not word:
+        return False
+    # Strip trailing quotes/brackets that may follow punctuation
+    stripped = word.rstrip('"\')}]')
+    return stripped.endswith(('.', '!', '?'))
+
+
+def fix_boundary_fragments(
+    labeled_words: list[dict],
+    max_fragment_words: int = 3,
+) -> list[dict]:
+    """
+    Fix sentence fragments at speaker turn boundaries using punctuation cues.
+
+    At each speaker change, checks for two patterns:
+
+    1. **Trailing fragment** — the outgoing speaker's turn ends with 1-3 words
+       that start a new sentence (after a period/!/?) which actually belong to
+       the *next* speaker:
+           Ben: It reminds me of New Year's. I
+           Jamie: haven't had sherry in years.
+         → Ben: It reminds me of New Year's.
+           Jamie: I haven't had sherry in years.
+
+    2. **Leading fragment** — the incoming speaker's turn starts with 1-3 words
+       that finish a sentence (ending in ./?/!) which actually belong to the
+       *previous* speaker:
+           Ben: I saw them at the
+           Jamie: store. Then we went home.
+         → Ben: I saw them at the store.
+           Jamie: Then we went home.
+
+    This relies on the ASR model producing punctuated text (e.g. parakeet v2).
+    """
+    if len(labeled_words) < 2:
+        return labeled_words
+
+    smoothed = [{**w} for w in labeled_words]
+    changed = True
+
+    while changed:
+        changed = False
+
+        # Find transition points (indices where speaker changes)
+        transitions = []
+        for i in range(1, len(smoothed)):
+            if smoothed[i]['speaker'] != smoothed[i - 1]['speaker']:
+                transitions.append(i)
+
+        for trans_idx in transitions:
+            outgoing_spk = smoothed[trans_idx - 1]['speaker']
+            incoming_spk = smoothed[trans_idx]['speaker']
+
+            # --- Trailing fragment: end of outgoing turn starts a new sentence ---
+            # Find the start of the outgoing speaker's contiguous run
+            run_start = trans_idx - 1
+            while run_start > 0 and smoothed[run_start - 1]['speaker'] == outgoing_spk:
+                run_start -= 1
+
+            # Find the last sentence-ending word in the outgoing run
+            last_sent_end = None
+            for i in range(trans_idx - 1, run_start - 1, -1):
+                if _word_ends_sentence(smoothed[i].get('word', '')):
+                    last_sent_end = i
+                    break
+
+            if last_sent_end is not None and last_sent_end < trans_idx - 1:
+                fragment_len = trans_idx - (last_sent_end + 1)
+                if 0 < fragment_len <= max_fragment_words:
+                    for i in range(last_sent_end + 1, trans_idx):
+                        smoothed[i] = {**smoothed[i], 'speaker': incoming_spk}
+                    changed = True
+                    break  # Restart — transitions are invalidated
+
+            # --- Leading fragment: start of incoming turn ends a sentence ---
+            # Find the end of the incoming speaker's contiguous run
+            run_end = trans_idx
+            while run_end < len(smoothed) - 1 and smoothed[run_end + 1]['speaker'] == incoming_spk:
+                run_end += 1
+
+            incoming_run_len = run_end - trans_idx + 1
+
+            # Look for first sentence-ending word in the incoming run (within limit)
+            first_sent_end = None
+            for i in range(trans_idx, min(trans_idx + max_fragment_words, run_end + 1)):
+                if _word_ends_sentence(smoothed[i].get('word', '')):
+                    first_sent_end = i
+                    break
+
+            if first_sent_end is not None:
+                fragment_len = first_sent_end - trans_idx + 1
+                remaining = incoming_run_len - fragment_len
+                if fragment_len <= max_fragment_words and remaining > 0:
+                    for i in range(trans_idx, first_sent_end + 1):
+                        smoothed[i] = {**smoothed[i], 'speaker': outgoing_spk}
+                    changed = True
+                    break  # Restart — transitions are invalidated
+
+    return smoothed
+
+
+# ─── Post-processing: smooth speaker turns ────────────────────────────
+
+def smooth_speaker_turns(
+    labeled_words: list[dict],
+    min_turn_words: int = 2,
+) -> list[dict]:
+    """
+    Smooth out noisy speaker transitions by merging micro-turns back into
+    surrounding context.
+
+    At speaker boundaries, diarization timestamps and ASR word timestamps
+    don't align perfectly, causing isolated words to be assigned to the wrong
+    speaker. This creates spurious mini-turns (1-2 words attributed to a
+    different speaker between runs of the same speaker).
+
+    The algorithm finds runs of consecutive words by the same speaker. Any run
+    shorter than `min_turn_words` that is sandwiched between two runs of the
+    same speaker is merged into the surrounding speaker. Runs at the very start
+    or end are merged into the adjacent run.
+
+    This is conservative: it never changes runs >= min_turn_words long, and
+    only merges when the surrounding context is unambiguous.
+    """
+    if len(labeled_words) < 3:
+        return labeled_words
+
+    # Build runs: [(speaker, start_idx, end_idx), ...]
+    runs = []
+    run_start = 0
+    for i in range(1, len(labeled_words)):
+        if labeled_words[i]['speaker'] != labeled_words[run_start]['speaker']:
+            runs.append((labeled_words[run_start]['speaker'], run_start, i))
+            run_start = i
+    runs.append((labeled_words[run_start]['speaker'], run_start, len(labeled_words)))
+
+    if len(runs) <= 1:
+        return labeled_words
+
+    # Identify micro-turns to merge
+    smoothed = list(labeled_words)  # shallow copy
+    changed = True
+    while changed:
+        changed = False
+        # Rebuild runs from current state
+        runs = []
+        run_start = 0
+        for i in range(1, len(smoothed)):
+            if smoothed[i]['speaker'] != smoothed[run_start]['speaker']:
+                runs.append((smoothed[run_start]['speaker'], run_start, i))
+                run_start = i
+        runs.append((smoothed[run_start]['speaker'], run_start, len(smoothed)))
+
+        for r_idx, (spk, s, e) in enumerate(runs):
+            run_len = e - s
+            if run_len >= min_turn_words:
+                continue  # This turn is long enough, leave it
+
+            # Determine surrounding speakers
+            prev_spk = runs[r_idx - 1][0] if r_idx > 0 else None
+            next_spk = runs[r_idx + 1][0] if r_idx < len(runs) - 1 else None
+
+            merge_to = None
+            if prev_spk and next_spk and prev_spk == next_spk:
+                # Sandwiched between same speaker — clear merge
+                merge_to = prev_spk
+            elif prev_spk and not next_spk:
+                # At the end — merge into previous
+                merge_to = prev_spk
+            elif next_spk and not prev_spk:
+                # At the start — merge into next
+                merge_to = next_spk
+
+            if merge_to and merge_to != spk:
+                for i in range(s, e):
+                    smoothed[i] = {**smoothed[i], 'speaker': merge_to}
+                changed = True
+                break  # Restart scan after change (runs are invalidated)
+
+    return smoothed
 
 def build_speaker_transcript(labeled_words: list[dict]) -> str:
     """Build a readable transcript grouped by speaker turns."""
@@ -659,6 +865,9 @@ Options:
                       File names become speaker labels (e.g., John_Smith.wav).
                       Underscores in names are replaced with spaces.
   --threshold N       Voiceprint match threshold 0.0-1.0 (default: 0.5)
+  --min-words N       Minimum words for a speaker turn to survive smoothing.
+                      Shorter turns between the same speaker are merged back.
+                      Higher = more aggressive smoothing (default: 2, 0 = off)
 
 Examples:
   python scenario1/transcribe-diarize.py                              # Process all files in {DEFAULT_INPUT_DIR}/
@@ -679,14 +888,14 @@ Output:
   - {{timestamp}}_{{filename}}_diarized.srt - Subtitles with speaker labels
 
 Models:
-  ASR     : nvidia/parakeet-tdt-0.6b-v2 (English transcription)
+  ASR     : nvidia/parakeet-tdt-0.6b-v2 (English, built-in punctuation & capitalization)
   Speaker : titanet_large (speaker embeddings)
   VAD     : vad_marblenet (voice activity detection, English)
 """)
 
 
-def parse_args(argv: list[str]) -> tuple[list[Path], int | None, int, Path | None, float, Path | None]:
-    """Parse CLI arguments. Returns (audio_paths, num_speakers, max_speakers, voiceprints_dir, threshold, input_dir)."""
+def parse_args(argv: list[str]) -> tuple[list[Path], int | None, int, Path | None, float, Path | None, int]:
+    """Parse CLI arguments. Returns (audio_paths, num_speakers, max_speakers, voiceprints_dir, threshold, input_dir, min_words)."""
     if argv and argv[0] in ['-h', '--help', 'help']:
         print_help()
         sys.exit(0)
@@ -697,6 +906,7 @@ def parse_args(argv: list[str]) -> tuple[list[Path], int | None, int, Path | Non
     voiceprints_dir = None
     threshold = 0.5
     input_dir = None
+    min_words = 2
 
     i = 0
     while i < len(argv):
@@ -715,6 +925,9 @@ def parse_args(argv: list[str]) -> tuple[list[Path], int | None, int, Path | Non
         elif argv[i] == '--input-dir' and i + 1 < len(argv):
             input_dir = Path(argv[i + 1])
             i += 2
+        elif argv[i] == '--min-words' and i + 1 < len(argv):
+            min_words = int(argv[i + 1])
+            i += 2
         elif argv[i].startswith('--'):
             print(f"Unknown argument: {argv[i]}")
             print_help()
@@ -724,7 +937,7 @@ def parse_args(argv: list[str]) -> tuple[list[Path], int | None, int, Path | Non
             audio_paths.append(Path(argv[i]))
             i += 1
 
-    return audio_paths, num_speakers, max_speakers, voiceprints_dir, threshold, input_dir
+    return audio_paths, num_speakers, max_speakers, voiceprints_dir, threshold, input_dir, min_words
 
 
 def discover_audio_files(input_dir: Path) -> list[Path]:
@@ -743,6 +956,7 @@ def process_file(
     max_speakers: int,
     voiceprints: dict,
     threshold: float,
+    min_words: int = 2,
 ):
     """Process a single audio file: diarize, transcribe, save outputs."""
     file_start = time.time()
@@ -776,6 +990,13 @@ def process_file(
         # Step 3: Align speakers to ASR output
         if words and diar_segments:
             labeled_words = assign_speakers_to_words(words, diar_segments)
+            # Fix sentence fragments split across speaker boundaries
+            # (e.g. "Ben: ...New Year's. I" / "Jamie: haven't had sherry...")
+            labeled_words = fix_boundary_fragments(labeled_words, max_fragment_words=3)
+            # Smooth out noisy speaker boundaries — merge isolated 1-word
+            # mis-assignments back into the surrounding speaker's turn
+            if min_words > 0:
+                labeled_words = smooth_speaker_turns(labeled_words, min_turn_words=min_words)
             speaker_transcript = build_speaker_transcript(labeled_words)
         else:
             speaker_transcript = full_text
@@ -831,7 +1052,7 @@ def process_file(
 
 
 def main():
-    audio_paths, num_speakers, max_speakers, voiceprints_dir, threshold, input_dir = parse_args(sys.argv[1:])
+    audio_paths, num_speakers, max_speakers, voiceprints_dir, threshold, input_dir, min_words = parse_args(sys.argv[1:])
 
     # Directories
     script_dir = Path(__file__).parent.resolve()
@@ -870,9 +1091,23 @@ def main():
     print("=" * 60)
     print("  Scenario 1: Transcription + Speaker Diarization")
     print("=" * 60)
-    print(f"\nFiles to process: {len(audio_paths)}")
-    for p in audio_paths:
+
+    # Skip files that already have output
+    def already_processed(audio: Path, out_dir: Path) -> bool:
+        stem = audio.stem
+        # Look for any *_{stem}_diarized.txt in output
+        return any(out_dir.glob(f"*_{stem}_diarized.txt"))
+
+    pending = [p for p in audio_paths if not already_processed(p, output_dir)]
+    skipped = len(audio_paths) - len(pending)
+    print(f"\nFiles to process: {len(pending)} of {len(audio_paths)}"
+          + (f"  ({skipped} already done, skipped)" if skipped else ""))
+    for p in pending:
         print(f"  - {p.name}")
+
+    if not pending:
+        print("\nAll files already processed. Nothing to do.")
+        sys.exit(0)
 
     # Load voiceprints once (shared across all files)
     voiceprints = {}
@@ -881,23 +1116,24 @@ def main():
 
     # Process each file
     batch_start = time.time()
-    for i, audio_path in enumerate(audio_paths, 1):
-        if len(audio_paths) > 1:
+    for i, audio_path in enumerate(pending, 1):
+        if len(pending) > 1:
             print(f"\n{'#' * 60}")
-            print(f"  File {i}/{len(audio_paths)}")
+            print(f"  File {i}/{len(pending)}")
             print(f"{'#' * 60}")
 
         process_file(
             audio_path, output_dir,
             num_speakers, max_speakers,
             voiceprints, threshold,
+            min_words=min_words,
         )
 
     batch_elapsed = time.time() - batch_start
     mins, secs = divmod(batch_elapsed, 60)
     print(f"\n{'=' * 60}")
-    if len(audio_paths) > 1:
-        print(f"  All {len(audio_paths)} files processed!")
+    if len(pending) > 1:
+        print(f"  All {len(pending)} files processed!")
     print(f"  Total time: {int(mins)}m {secs:.1f}s")
     print(f"{'=' * 60}")
 

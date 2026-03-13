@@ -57,6 +57,9 @@ python scenario1/transcribe-diarize.py --voiceprints voiceprints/
 
 # Adjust match sensitivity (default: 0.5, higher = stricter)
 python scenario1/transcribe-diarize.py meeting.mp3 --voiceprints voiceprints/ --threshold 0.6
+
+# Reduce speaker bleed at turn boundaries (default: 2, higher = more smoothing, 0 = off)
+python scenario1/transcribe-diarize.py meeting.mp3 --min-words 3
 ```
 
 ### Voiceprints (Speaker Recognition)
